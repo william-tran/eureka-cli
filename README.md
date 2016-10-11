@@ -1,5 +1,5 @@
 # eureka-cli
-A prototype CLI for managing a Spring Cloud Services Service Registry service instance
+A prototype CLI for interacting with a Spring Cloud Services Service Registry service instance
 ```
 NAME:
    eureka - interact with a Service Registry Service Instance as a bound application
