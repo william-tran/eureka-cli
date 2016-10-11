@@ -1,0 +1,159 @@
+#!/bin/bash
+
+command=$1
+app_name=$2
+status=$3
+
+function usage {
+  >&2 echo 'NAME:'
+  >&2 echo '   eureka - interact with a Service Registry Service Instance as a bound application'  
+  >&2 echo 'USAGE:'
+  >&2 echo '   eureka command cf-app-name [status]'
+  >&2 echo 'COMMANDS:'
+  >&2 echo '   registry        - Dump the entire registry as JSON. The server responds with cached' 
+  >&2 echo '                     data that is refreshed every 30 seconds.' 
+  >&2 echo '   apps            - Display the registry as a table. Also cached data.'
+  >&2 echo '   override-status - Override the status of the bound app'"'"'s instances. Affected instance'
+  >&2 echo '                     records are returned, which are not cached data.'
+  >&2 echo '   delete-override - Delete the status override, optionally setting the status of the bound'
+  >&2 echo '                     app'"'"'s instances, or allowing it to be determined automatically.' 
+  >&2 echo '                     Affected instance records are returned, which are not cached data.'
+  >&2 echo '   deregister      - Remove the instance records of the bound app'"'"'s instances' 
+  >&2 echo 'STATUSES:'
+  >&2 echo '   UP - Ready to receive traffic'
+  >&2 echo '   DOWN - Do not send traffic - healthcheck callback failed'
+  >&2 echo '   STARTING - Do not send traffic - initializations to be done'
+  >&2 echo '   OUT_OF_SERVICE - Intentionally shutdown for traffic'
+  >&2 echo '   UNKNOWN - Do not send traffic - status to be determined automatically'
+  exit 1
+}
+
+function validate_command_line {
+  if [[ -z $command ]]; then
+    >&2 echo "Command required"
+    usage
+  elif [[ $command != "registry" && $command != "apps" && $command != "override-status" && $command != "delete-override" && $command != "deregister" ]]; then
+    >&2 echo "Invalid command $command"
+    usage
+  elif [[ -z $app_name ]]; then
+    >&2 echo "Parameter cf-app-name is required"
+    usage
+  elif [[ $command == "override-status" && -z "$status" ]]; then
+    >&2 echo "Command override-status requires status parameter"
+    usage
+  elif [[ "$status" != "" && "$status" != "UP" && "$status" != "DOWN" && "$status" != "STARTING" && "$status" != "OUT_OF_SERVICE" && "$status" != "UNKNOWN" ]]; then
+    >&2 echo "Status must be UP, DOWN, STARTING, OUT_OF_SERVICE, or UNKNOWN"
+    usage
+  fi
+}
+
+function request {
+  method=$1
+  path=$2
+ 
+# >&2 echo "Performing $method request for $eureka_uri$path as $app_name"
+  curl -s -k -H "Authorization: bearer $token" -H "Accept: application/json" -X $method $eureka_uri$path
+}
+
+function show_instance {
+  instance_path=$1
+  instance=$( request GET "/eureka/apps/$instance_path" | jq -r '.instance | [.app, .instanceId, .status] | join(" ")' )
+  >&2 echo "Instance state is now..."
+  >&2 echo "------------------------"
+  echo "$instance"
+}
+
+validate_command_line
+
+>&2 echo "Getting guid for $app_name"
+
+app_guid=$( cf app $app_name --guid)
+
+if [ $? -ne 0 ]; then
+  >&2 echo "App $app_name not found"
+  exit 1
+fi
+
+>&2 echo "Getting service registry binding credentials for $app_name"
+
+credentials=( $( cf curl /v2/apps/$app_guid/env \
+| jq -cr '.system_env_json.VCAP_SERVICES["p-service-registry"][0].credentials | .access_token_uri,.client_id,.client_secret,.uri') )
+
+if [[ $credentials == "null" ]]; then
+  >&2 echo "No service registry binding credentials found for $app_name"
+  exit 1
+fi
+
+access_token_uri=${credentials[0]}
+client_id=${credentials[1]}
+client_secret=${credentials[2]}
+eureka_uri=${credentials[3]}
+
+>&2 echo "Getting token for $app_name from $access_token_uri"
+
+token=$(curl -s -k $access_token_uri -u $client_id:$client_secret -d grant_type=client_credentials | jq -r .access_token)
+
+if [ $? -ne 0 ]; then
+  >&2 echo "Access token could not be retrieved for $app_name"
+  exit 1
+fi
+
+registry=$(request GET /eureka/apps)
+ 
+if [ $? -ne 0 ]; then
+  >&2 echo "Could not fetch registry"
+  exit 1
+fi
+
+if [ $command == "registry" ]; then
+  echo -n $registry | jq 
+  exit 0
+elif [ $command == "apps" ]; then  
+  
+  awkcmd='
+	BEGIN { print "appId                instanceId                                                                       this_eureka  this_cf_app  status           statusOverridden" }
+	BEGIN { print "-----------------------------------------------------------------------------------------------------------------------------------------------------------------" }
+	      { printf "%-20s %-80s %-12s %-12s %-16s %-16s\n", $1, $2, $3, $4, $5, $6 }'  
+  
+  echo -n $registry | jq -r --arg client_id "$client_id" --arg eureka_uri "$eureka_uri" '.applications.application[].instance[] | select(.app != "EUREKA-SERVER") | [.] | map([.app,.instanceId, ( $eureka_uri == "https://"+.metadata.registrar_uri | tostring), (.metadata.registrant_principal==$client_id|tostring), .status, (.overriddenstatus != "UNKNOWN" |tostring)] | join(" ")) | .[]' | sort | awk "$awkcmd"
+  exit 0
+fi
+
+instance_paths=$( echo -n $registry | jq  --arg client_id "$client_id" -r '[.applications.application[].instance[] | select (.metadata.registrant_principal == $client_id) ] | map([.app,.instanceId] | join("/") ) | .[]' ) 
+
+if [ $command == "override-status" ]; then
+  for instance_path in $instance_paths
+  do
+    request PUT "/eureka/apps/$instance_path/status?value=$status"
+  done
+  
+  for instance_path in $instance_paths
+  do
+    show_instance $instance_path
+  done
+elif [ $command == "delete-override" ]; then
+  if [ -n "$status"  ]; then
+    query="?value=$status"
+  fi
+  
+  for instance_path in $instance_paths
+  do
+    request DELETE "/eureka/apps/$instance_path/status$query"
+  done
+  
+  for instance_path in $instance_paths
+  do
+    show_instance $instance_path
+  done
+  
+elif [ $command == "deregister" ]; then
+  status=$3
+  for instance_path in $instance_paths
+  do
+    request DELETE "/eureka/apps/$instance_path"
+  done  
+else
+  >&2 echo "Invalid command $command"
+  exit 1
+fi
+
